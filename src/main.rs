@@ -4,10 +4,8 @@
 //! certificates for mTLS authentication.
 
 use clap::{Parser, Subcommand};
-use detls::cert::ca::create_root_ca;
-use detls::cert::entity::create_end_entity_cert;
-use detls::cert::intermediate::create_intermediate_ca;
 use detls::cert::loader::{load_certificate_from_pem, load_certificates_from_pem};
+use detls::cert::x509_signing::{create_self_signed_ca, sign_certificate};
 use detls::crypto::ed25519::{generate_ed25519_keypair, import_ed25519_from_bytes};
 use detls::error::Result;
 use detls::net::client::{mtls_request, HttpMethod};
@@ -127,6 +125,7 @@ enum KeyCommands {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::enum_variant_names)]
 enum CertCommands {
     /// Create a Root CA certificate
     CreateRoot {
@@ -362,29 +361,22 @@ fn handle_cert_command(cmd: CertCommands) -> Result<()> {
             let keystore_path = path.unwrap_or_else(|| PathBuf::from("."));
             let keystore = create_keystore(&keystore_path)?;
 
-            // Prompt for password
             let password = rpassword::prompt_password("Enter password to decrypt key: ")?;
-
-            // Get key
             let keypair = get_key(&keystore, &key_alias, &password)?;
 
-            // Create Root CA certificate
-            let cert = create_root_ca(&keypair, &subject, validity_days)?;
+            let pem = create_self_signed_ca(&keypair, &subject, validity_days)?;
+            fs::write(&output, &pem)?;
 
-            // Write to file
-            let pem = cert
-                .serialize_pem()
-                .map_err(|e| detls::error::DeTlsError::CertificateError(e.to_string()))?;
-            fs::write(&output, pem)?;
-
-            println!("Created Root CA certificate: {}", output.display());
+            println!("✓ Created Root CA certificate: {}", output.display());
+            println!("  Subject: {}", subject);
+            println!("  Valid for: {} days", validity_days);
 
             Ok(())
         }
 
         CertCommands::CreateIntermediate {
-            root_key: _,
-            root_cert: _,
+            root_key,
+            root_cert,
             key_alias,
             subject,
             output,
@@ -394,39 +386,43 @@ fn handle_cert_command(cmd: CertCommands) -> Result<()> {
             let keystore_path = path.unwrap_or_else(|| PathBuf::from("."));
             let keystore = create_keystore(&keystore_path)?;
 
-            // Note: In rcgen 0.12, we can't easily load and use an existing root certificate for signing.
-            // For now, we create a self-signed intermediate certificate with the right parameters.
-            // In a production system, you would use a newer version of rcgen or x509-cert directly.
-
-            // Prompt for password
             let password = rpassword::prompt_password("Enter password to decrypt key: ")?;
 
             // Get intermediate key
             let inter_keypair = get_key(&keystore, &key_alias, &password)?;
 
-            // Create a placeholder root cert (self-signed intermediate in practice)
-            let placeholder_root = create_root_ca(&inter_keypair, "CN=Placeholder", 1)?;
+            // Load Root CA certificate
+            let root_ca_pem = fs::read_to_string(&root_cert)?;
 
-            // Create Intermediate CA certificate
-            let inter_cert =
-                create_intermediate_ca(&placeholder_root, &inter_keypair, &subject, validity_days)?;
+            // Get Root CA key
+            let root_ca_keypair = get_key(&keystore, &root_key, &password)?;
 
-            // Write to file
-            let pem = inter_cert
-                .serialize_pem()
-                .map_err(|e| detls::error::DeTlsError::CertificateError(e.to_string()))?;
-            fs::write(&output, pem)?;
+            // Sign intermediate certificate with Root CA
+            let inter_pem = sign_certificate(
+                &inter_keypair,
+                &subject,
+                &root_ca_keypair,
+                &root_ca_pem,
+                true, // Is a CA
+                validity_days,
+            )?;
 
-            println!("Created Intermediate CA certificate: {}", output.display());
-            println!("WARNING: Certificate is SELF-SIGNED due to rcgen 0.12 API limitations");
-            println!("         Not suitable for production use without proper CA signing");
+            fs::write(&output, &inter_pem)?;
+
+            println!(
+                "✓ Created Intermediate CA certificate: {}",
+                output.display()
+            );
+            println!("  Subject: {}", subject);
+            println!("  Signed by: Root CA ({})", root_cert.display());
+            println!("  Valid for: {} days", validity_days);
 
             Ok(())
         }
 
         CertCommands::CreateEntity {
-            inter_key: _,
-            inter_cert: _,
+            inter_key,
+            inter_cert,
             key_alias,
             subject,
             output,
@@ -444,26 +440,28 @@ fn handle_cert_command(cmd: CertCommands) -> Result<()> {
             // Get entity key
             let entity_keypair = get_key(&keystore, &key_alias, &password)?;
 
-            // Create a placeholder intermediate cert
-            let placeholder_inter = create_root_ca(&entity_keypair, "CN=Placeholder", 1)?;
+            // Load CA certificate
+            let ca_pem = fs::read_to_string(&inter_cert)?;
 
-            // Create end-entity certificate
-            let entity_cert = create_end_entity_cert(
-                &placeholder_inter,
+            // Get CA key (reuse password from entity key)
+            let ca_keypair = get_key(&keystore, &inter_key, &password)?;
+
+            // Sign entity certificate with CA
+            let entity_pem = sign_certificate(
                 &entity_keypair,
                 &subject,
+                &ca_keypair,
+                &ca_pem,
+                false, // Not a CA
                 validity_days,
             )?;
 
-            // Write to file
-            let pem = entity_cert
-                .serialize_pem()
-                .map_err(|e| detls::error::DeTlsError::CertificateError(e.to_string()))?;
-            fs::write(&output, pem)?;
+            fs::write(&output, &entity_pem)?;
 
-            println!("Created end-entity certificate: {}", output.display());
-            println!("WARNING: Certificate is SELF-SIGNED due to rcgen 0.12 API limitations");
-            println!("         Not suitable for production use without proper CA signing");
+            println!("✓ Created end-entity certificate: {}", output.display());
+            println!("  Subject: {}", subject);
+            println!("  Signed by: CA ({})", inter_cert.display());
+            println!("  Valid for: {} days", validity_days);
 
             Ok(())
         }

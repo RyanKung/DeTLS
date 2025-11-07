@@ -7,3 +7,4 @@ pub mod ca;
 pub mod entity;
 pub mod intermediate;
 pub mod loader;
+pub mod x509_signing;

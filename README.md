@@ -39,9 +39,9 @@ Generate a new Ed25519 keypair:
 detls key generate --alias my-key
 ```
 
-Import an existing key:
+Import an existing key (from hex):
 ```bash
-detls key import --alias imported-key --file key.bin
+detls key import --alias imported-key --hex-key "HEXADECIMAL_KEY_HERE"
 ```
 
 List all keys:
@@ -51,7 +51,8 @@ detls key list
 
 Export a key:
 ```bash
-detls key export --alias my-key --output exported-key.bin
+detls key export --alias my-key
+# This will output the key in hexadecimal format
 ```
 
 Delete a key:
@@ -81,11 +82,21 @@ detls cert create-intermediate \
   --validity-days 1825
 ```
 
-Create an end-entity certificate:
+Create an end-entity certificate (can use either Root CA or Intermediate CA for signing):
 ```bash
+# Option A: Signed by Intermediate CA
 detls cert create-entity \
   --inter-key inter-key \
   --inter-cert intermediate-ca.pem \
+  --key-alias entity-key \
+  --subject "CN=example.com,O=My Organization" \
+  --output entity.pem \
+  --validity-days 365
+
+# Option B: Signed directly by Root CA
+detls cert create-entity \
+  --inter-key root-key \
+  --inter-cert root-ca.pem \
   --key-alias entity-key \
   --subject "CN=example.com,O=My Organization" \
   --output entity.pem \
@@ -105,22 +116,37 @@ DeTLS can also be used as a library:
 
 ```rust
 use detls::crypto::ed25519::generate_ed25519_keypair;
-use detls::cert::ca::create_root_ca;
+use detls::cert::x509_signing::{create_self_signed_ca, sign_certificate};
 use detls::storage::keystore::{create_keystore, import_key};
 use std::path::Path;
 
-fn main() -> detls::Result<()> {
-    // Generate a keypair
-    let keypair = generate_ed25519_keypair()?;
+fn main() -> detls::error::Result<()> {
+    // Generate keypairs
+    let root_keypair = generate_ed25519_keypair()?;
+    let client_keypair = generate_ed25519_keypair()?;
     
     // Create/load keystore
     let mut keystore = create_keystore(Path::new("."))?;
     
-    // Import key with password
-    import_key(&mut keystore, "my-key".to_string(), &keypair.secret_bytes(), "password")?;
+    // Import keys with password
+    import_key(&mut keystore, "root".to_string(), &root_keypair.secret_bytes(), "password")?;
+    import_key(&mut keystore, "client".to_string(), &client_keypair.secret_bytes(), "password")?;
     
-    // Create a Root CA certificate
-    let cert = create_root_ca(&keypair, "CN=My CA", 365)?;
+    // Create a Root CA certificate (self-signed)
+    let root_ca_pem = create_self_signed_ca(&root_keypair, "CN=My Root CA", 365)?;
+    
+    // Sign a client certificate with the Root CA
+    let client_cert_pem = sign_certificate(
+        &client_keypair,
+        "CN=Client 1",
+        &root_keypair,
+        &root_ca_pem,
+        false, // Not a CA
+        365,
+    )?;
+    
+    println!("Root CA:\n{}", root_ca_pem);
+    println!("Client Certificate:\n{}", client_cert_pem);
     
     Ok(())
 }
@@ -183,24 +209,49 @@ This project strictly follows **Test-Driven Development (TDD)**:
 
 For detailed API documentation, run `cargo doc --open`.
 
-## Current Limitations
+## Certificate Signing Implementation
 
-Due to dependency API constraints, the following limitations exist:
+✅ **Proper X.509 certificate signing implemented** (using x509-cert)
 
-### Certificate Signing (rcgen 0.12)
-⚠️ **Intermediate and entity certificates are SELF-SIGNED**
+**Implementation**: Added `cert/x509_signing.rs` module with full certificate chain signing support  
+**Features**:
+- Root CA self-signing (standard PKI practice)
+- Intermediate CA signed by Root CA
+- End-entity certificates signed by any CA (Root or Intermediate)
+- Proper issuer/subject relationships in certificate chains
+- Compliant with enterprise PKI standards
 
-**Reason**: rcgen 0.12 lacks API for signing with external CA  
-**Impact**: Certificate chains are not properly signed  
-**Workaround**: Upgrade to rcgen 0.13+ or use x509-cert directly  
-**CLI Warning**: Commands display clear warning about this limitation
+**Usage**:
+```bash
+# 1. Generate keys for CA hierarchy
+detls key generate --alias root-key
+detls key generate --alias inter-key
+detls key generate --alias client-key
 
-### Certificate Loading  
-✅ **PEM certificate loading implemented** (using rustls-pemfile)
+# 2. Create Root CA (self-signed - standard practice)
+detls cert create-root \
+  --key-alias root-key \
+  --subject "CN=My Root CA" \
+  --output root-ca.pem
 
-**Solution**: Added `cert/loader.rs` module for PEM → DER conversion  
-**Impact**: curl command now works with external PEM certificates  
-**Status**: Fully functional for mTLS client operations
+# 3. Create Intermediate CA (signed by Root CA)
+detls cert create-intermediate \
+  --key-alias inter-key \
+  --root-key root-key \
+  --root-cert root-ca.pem \
+  --subject "CN=Intermediate CA" \
+  --output inter-ca.pem
+
+# 4. Create client certificate (signed by Intermediate CA)
+detls cert create-entity \
+  --key-alias client-key \
+  --inter-key inter-key \
+  --inter-cert inter-ca.pem \
+  --subject "CN=Client 1" \
+  --output client.pem
+```
+
+### Current Limitations
 
 ### WASM Compilation
 ⚠️ **Limited WASM support**

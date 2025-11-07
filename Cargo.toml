@@ -12,14 +12,16 @@ name = "detls"
 path = "src/main.rs"
 
 [dependencies]
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
-x509-cert = "0.2"
+ed25519-dalek = { version = "2.1", features = ["rand_core", "pkcs8"] }
+x509-cert = { version = "0.2", features = ["builder", "pem"] }
+der = { version = "0.7", features = ["alloc", "pem", "oid"] }
+spki = { version = "0.7", features = ["alloc", "pem"] }
+const-oid = "0.9"
 rcgen = { version = "0.12", features = ["pem"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.0"
 rsa = "0.9"
 aes-gcm = "0.10"
-generic-array = "1.0"
 ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
 hyper = { version = "1.0", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "tokio"] }
