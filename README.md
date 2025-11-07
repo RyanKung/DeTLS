@@ -1,4 +1,14 @@
+<div align="center">
+  <img src="logo.png" alt="DeTLS Logo" height="120">
+</div>
+
 # DeTLS: Decentralized TLS with Ed25519 Keys
+
+<div align="center">
+  <em>Decentralized TLS with Ed25519 Keys</em>
+</div>
+
+<br>
 
 DeTLS is a command-line tool and Rust library for managing Ed25519-based X.509 certificates for mutual TLS (mTLS) authentication. It enables users to generate self-hosted HTTPS certificates using Solana-compatible Ed25519 keys.
 
