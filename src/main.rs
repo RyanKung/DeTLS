@@ -90,15 +90,19 @@ enum KeyCommands {
         path: Option<PathBuf>,
     },
 
-    /// Export a key
+    /// Export a private key
     Export {
-        /// Key alias
+        /// Alias of the key to export
         #[arg(long)]
         alias: String,
 
-        /// Output file
+        /// Output format: hex, pem, or der
+        #[arg(long, default_value = "hex")]
+        format: String,
+
+        /// Optional output file (if not specified, prints to stdout)
         #[arg(long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
 
         /// Keystore path (default: current directory)
         #[arg(long)]
@@ -286,22 +290,75 @@ fn handle_key_command(cmd: KeyCommands) -> Result<()> {
 
         KeyCommands::Export {
             alias,
+            format,
             output,
             path,
         } => {
             let keystore_path = path.unwrap_or_else(|| PathBuf::from("."));
             let keystore = create_keystore(&keystore_path)?;
 
-            // Prompt for password
             let password = rpassword::prompt_password("Enter password to decrypt key: ")?;
-
-            // Export key
             let key_bytes = export_key(&keystore, &alias, &password)?;
 
-            // Write to file
-            fs::write(&output, key_bytes)?;
+            let formatted_output = match format.to_lowercase().as_str() {
+                "hex" => hex::encode(&key_bytes),
+                "pem" => {
+                    // Ed25519 PKCS#8 format
+                    let mut pkcs8_der = vec![
+                        0x30, 0x2e, // SEQUENCE (46 bytes)
+                        0x02, 0x01, 0x00, // INTEGER 0 (version)
+                        0x30, 0x05, // SEQUENCE (algorithm identifier)
+                        0x06, 0x03, 0x2b, 0x65, 0x70, // OID 1.3.101.112 (Ed25519)
+                        0x04, 0x22, // OCTET STRING (34 bytes)
+                        0x04, 0x20, // OCTET STRING (32 bytes) - the actual key
+                    ];
+                    pkcs8_der.extend_from_slice(&key_bytes);
+                    pem::encode(&pem::Pem::new("PRIVATE KEY", pkcs8_der))
+                }
+                "der" => {
+                    // PKCS#8 DER format - output raw bytes
+                    if output.is_none() {
+                        return Err(detls::error::DeTlsError::ParseError(
+                            "DER format requires --output file (binary data)".to_string(),
+                        ));
+                    }
+                    let mut pkcs8_der = vec![
+                        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
+                        0x04, 0x22, 0x04, 0x20,
+                    ];
+                    pkcs8_der.extend_from_slice(&key_bytes);
+                    // Write binary directly for DER
+                    if let Some(ref output_path) = output {
+                        fs::write(output_path, &pkcs8_der)?;
+                        println!(
+                            "Exported key '{}' in DER format to: {}",
+                            alias,
+                            output_path.display()
+                        );
+                        return Ok(());
+                    }
+                    String::new() // Won't reach here due to check above
+                }
+                _ => {
+                    return Err(detls::error::DeTlsError::ParseError(format!(
+                        "Unsupported format: '{}'. Use 'hex', 'pem', or 'der'",
+                        format
+                    )));
+                }
+            };
 
-            println!("Exported key '{}' to: {}", alias, output.display());
+            // Write to file or stdout
+            if let Some(output_path) = output {
+                fs::write(&output_path, formatted_output.as_bytes())?;
+                println!(
+                    "Exported key '{}' in {} format to: {}",
+                    alias,
+                    format,
+                    output_path.display()
+                );
+            } else {
+                println!("{}", formatted_output);
+            }
 
             Ok(())
         }
