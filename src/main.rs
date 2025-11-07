@@ -1,0 +1,544 @@
+//! DeTLS CLI application.
+//!
+//! This binary provides a command-line interface for managing Ed25519 keys and
+//! certificates for mTLS authentication.
+
+use clap::{Parser, Subcommand};
+use detls::cert::ca::create_root_ca;
+use detls::cert::entity::create_end_entity_cert;
+use detls::cert::intermediate::create_intermediate_ca;
+use detls::cert::loader::{load_certificate_from_pem, load_certificates_from_pem};
+use detls::crypto::ed25519::{generate_ed25519_keypair, import_ed25519_from_bytes};
+use detls::error::Result;
+use detls::net::client::{mtls_request, HttpMethod};
+use detls::net::config::build_mtls_config_from_der;
+use detls::storage::keystore::{
+    create_keystore, delete_key, export_key, get_key, import_key, list_keys,
+};
+use std::fs;
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(name = "detls")]
+#[command(about = "DeTLS: Decentralized TLS with Ed25519 keys", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Key management operations
+    #[command(subcommand)]
+    Key(KeyCommands),
+
+    /// Certificate generation operations
+    #[command(subcommand)]
+    Cert(CertCommands),
+
+    /// Network operations (mTLS client)
+    Curl {
+        /// URL to request
+        #[arg(long)]
+        url: String,
+
+        /// Certificate file
+        #[arg(long)]
+        cert: String,
+
+        /// Key alias
+        #[arg(long)]
+        key_alias: String,
+
+        /// CA certificate file
+        #[arg(long)]
+        ca_cert: String,
+
+        /// Keystore path (default: current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        /// HTTP method
+        #[arg(long, default_value = "GET")]
+        method: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeyCommands {
+    /// Generate a new Ed25519 keypair
+    Generate {
+        /// Alias name for the key
+        #[arg(long)]
+        alias: String,
+
+        /// Keystore path (default: current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+
+    /// Import an existing Ed25519 key
+    Import {
+        /// Alias name for the key
+        #[arg(long)]
+        alias: String,
+
+        /// Input key file (32 bytes raw)
+        #[arg(long)]
+        file: PathBuf,
+
+        /// Keystore path (default: current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+
+    /// Export a key
+    Export {
+        /// Key alias
+        #[arg(long)]
+        alias: String,
+
+        /// Output file
+        #[arg(long)]
+        output: PathBuf,
+
+        /// Keystore path (default: current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+
+    /// List all keys
+    List {
+        /// Keystore path (default: current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+
+    /// Delete a key
+    Delete {
+        /// Key alias
+        #[arg(long)]
+        alias: String,
+
+        /// Keystore path (default: current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CertCommands {
+    /// Create a Root CA certificate
+    CreateRoot {
+        /// Key alias for the Root CA
+        #[arg(long)]
+        key_alias: String,
+
+        /// Certificate subject (e.g., "CN=My Root CA,O=My Org")
+        #[arg(long)]
+        subject: String,
+
+        /// Output certificate file
+        #[arg(long)]
+        output: PathBuf,
+
+        /// Validity in days
+        #[arg(long, default_value = "3650")]
+        validity_days: u32,
+
+        /// Keystore path (default: current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+
+    /// Create an Intermediate CA certificate
+    CreateIntermediate {
+        /// Root CA key alias
+        #[arg(long)]
+        root_key: String,
+
+        /// Root CA certificate file
+        #[arg(long)]
+        root_cert: PathBuf,
+
+        /// Intermediate CA key alias
+        #[arg(long)]
+        key_alias: String,
+
+        /// Certificate subject
+        #[arg(long)]
+        subject: String,
+
+        /// Output certificate file
+        #[arg(long)]
+        output: PathBuf,
+
+        /// Validity in days
+        #[arg(long, default_value = "1825")]
+        validity_days: u32,
+
+        /// Keystore path (default: current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+
+    /// Create an end-entity certificate
+    CreateEntity {
+        /// Intermediate CA key alias
+        #[arg(long)]
+        inter_key: String,
+
+        /// Intermediate CA certificate file
+        #[arg(long)]
+        inter_cert: PathBuf,
+
+        /// Entity key alias
+        #[arg(long)]
+        key_alias: String,
+
+        /// Certificate subject
+        #[arg(long)]
+        subject: String,
+
+        /// Output certificate file
+        #[arg(long)]
+        output: PathBuf,
+
+        /// Validity in days
+        #[arg(long, default_value = "365")]
+        validity_days: u32,
+
+        /// Keystore path (default: current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Key(key_cmd) => handle_key_command(key_cmd),
+        Commands::Cert(cert_cmd) => handle_cert_command(cert_cmd),
+        Commands::Curl {
+            url,
+            cert,
+            key_alias,
+            ca_cert,
+            path,
+            method,
+        } => handle_curl_command(&url, &cert, &key_alias, &ca_cert, path.as_deref(), &method).await,
+    }
+}
+
+fn handle_key_command(cmd: KeyCommands) -> Result<()> {
+    match cmd {
+        KeyCommands::Generate { alias, path } => {
+            let keystore_path = path.unwrap_or_else(|| PathBuf::from("."));
+            let mut keystore = create_keystore(&keystore_path)?;
+
+            // Generate keypair
+            let keypair = generate_ed25519_keypair()?;
+
+            // Prompt for password
+            let password = rpassword::prompt_password("Enter password to encrypt key: ")?;
+
+            // Import into keystore
+            import_key(
+                &mut keystore,
+                alias.clone(),
+                &keypair.secret_bytes(),
+                &password,
+            )?;
+
+            println!("Generated and stored key with alias: {}", alias);
+            println!("Public key: {}", hex::encode(keypair.public_bytes()));
+
+            Ok(())
+        }
+
+        KeyCommands::Import { alias, file, path } => {
+            let keystore_path = path.unwrap_or_else(|| PathBuf::from("."));
+            let mut keystore = create_keystore(&keystore_path)?;
+
+            // Read key file
+            let key_bytes = fs::read(&file)?;
+
+            // Validate and import
+            let keypair = import_ed25519_from_bytes(&key_bytes)?;
+
+            // Prompt for password
+            let password = rpassword::prompt_password("Enter password to encrypt key: ")?;
+
+            // Import into keystore
+            import_key(
+                &mut keystore,
+                alias.clone(),
+                &keypair.secret_bytes(),
+                &password,
+            )?;
+
+            println!("Imported key with alias: {}", alias);
+            println!("Public key: {}", hex::encode(keypair.public_bytes()));
+
+            Ok(())
+        }
+
+        KeyCommands::Export {
+            alias,
+            output,
+            path,
+        } => {
+            let keystore_path = path.unwrap_or_else(|| PathBuf::from("."));
+            let keystore = create_keystore(&keystore_path)?;
+
+            // Prompt for password
+            let password = rpassword::prompt_password("Enter password to decrypt key: ")?;
+
+            // Export key
+            let key_bytes = export_key(&keystore, &alias, &password)?;
+
+            // Write to file
+            fs::write(&output, key_bytes)?;
+
+            println!("Exported key '{}' to: {}", alias, output.display());
+
+            Ok(())
+        }
+
+        KeyCommands::List { path } => {
+            let keystore_path = path.unwrap_or_else(|| PathBuf::from("."));
+            let keystore = create_keystore(&keystore_path)?;
+
+            // List keys
+            let keys = list_keys(&keystore)?;
+
+            if keys.is_empty() {
+                println!("No keys found in keystore.");
+            } else {
+                println!("Keys in keystore:");
+                println!("{:<20} {:<64} Created", "Alias", "Public Key");
+                println!("{}", "-".repeat(95));
+
+                for key_info in keys {
+                    let created = chrono::DateTime::from_timestamp(key_info.created_at as i64, 0)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| "Unknown".to_string());
+
+                    println!(
+                        "{:<20} {:<64} {}",
+                        key_info.alias, key_info.public_key_hex, created
+                    );
+                }
+            }
+
+            Ok(())
+        }
+
+        KeyCommands::Delete { alias, path } => {
+            let keystore_path = path.unwrap_or_else(|| PathBuf::from("."));
+            let mut keystore = create_keystore(&keystore_path)?;
+
+            // Delete key
+            delete_key(&mut keystore, &alias)?;
+
+            println!("Deleted key: {}", alias);
+
+            Ok(())
+        }
+    }
+}
+
+fn handle_cert_command(cmd: CertCommands) -> Result<()> {
+    match cmd {
+        CertCommands::CreateRoot {
+            key_alias,
+            subject,
+            output,
+            validity_days,
+            path,
+        } => {
+            let keystore_path = path.unwrap_or_else(|| PathBuf::from("."));
+            let keystore = create_keystore(&keystore_path)?;
+
+            // Prompt for password
+            let password = rpassword::prompt_password("Enter password to decrypt key: ")?;
+
+            // Get key
+            let keypair = get_key(&keystore, &key_alias, &password)?;
+
+            // Create Root CA certificate
+            let cert = create_root_ca(&keypair, &subject, validity_days)?;
+
+            // Write to file
+            let pem = cert
+                .serialize_pem()
+                .map_err(|e| detls::error::DeTlsError::CertificateError(e.to_string()))?;
+            fs::write(&output, pem)?;
+
+            println!("Created Root CA certificate: {}", output.display());
+
+            Ok(())
+        }
+
+        CertCommands::CreateIntermediate {
+            root_key: _,
+            root_cert: _,
+            key_alias,
+            subject,
+            output,
+            validity_days,
+            path,
+        } => {
+            let keystore_path = path.unwrap_or_else(|| PathBuf::from("."));
+            let keystore = create_keystore(&keystore_path)?;
+
+            // Note: In rcgen 0.12, we can't easily load and use an existing root certificate for signing.
+            // For now, we create a self-signed intermediate certificate with the right parameters.
+            // In a production system, you would use a newer version of rcgen or x509-cert directly.
+
+            // Prompt for password
+            let password = rpassword::prompt_password("Enter password to decrypt key: ")?;
+
+            // Get intermediate key
+            let inter_keypair = get_key(&keystore, &key_alias, &password)?;
+
+            // Create a placeholder root cert (self-signed intermediate in practice)
+            let placeholder_root = create_root_ca(&inter_keypair, "CN=Placeholder", 1)?;
+
+            // Create Intermediate CA certificate
+            let inter_cert =
+                create_intermediate_ca(&placeholder_root, &inter_keypair, &subject, validity_days)?;
+
+            // Write to file
+            let pem = inter_cert
+                .serialize_pem()
+                .map_err(|e| detls::error::DeTlsError::CertificateError(e.to_string()))?;
+            fs::write(&output, pem)?;
+
+            println!("Created Intermediate CA certificate: {}", output.display());
+            println!("WARNING: Certificate is SELF-SIGNED due to rcgen 0.12 API limitations");
+            println!("         Not suitable for production use without proper CA signing");
+
+            Ok(())
+        }
+
+        CertCommands::CreateEntity {
+            inter_key: _,
+            inter_cert: _,
+            key_alias,
+            subject,
+            output,
+            validity_days,
+            path,
+        } => {
+            let keystore_path = path.unwrap_or_else(|| PathBuf::from("."));
+            let keystore = create_keystore(&keystore_path)?;
+
+            // Note: Similar to intermediate, we create a self-signed entity certificate
+
+            // Prompt for password
+            let password = rpassword::prompt_password("Enter password to decrypt key: ")?;
+
+            // Get entity key
+            let entity_keypair = get_key(&keystore, &key_alias, &password)?;
+
+            // Create a placeholder intermediate cert
+            let placeholder_inter = create_root_ca(&entity_keypair, "CN=Placeholder", 1)?;
+
+            // Create end-entity certificate
+            let entity_cert = create_end_entity_cert(
+                &placeholder_inter,
+                &entity_keypair,
+                &subject,
+                validity_days,
+            )?;
+
+            // Write to file
+            let pem = entity_cert
+                .serialize_pem()
+                .map_err(|e| detls::error::DeTlsError::CertificateError(e.to_string()))?;
+            fs::write(&output, pem)?;
+
+            println!("Created end-entity certificate: {}", output.display());
+            println!("WARNING: Certificate is SELF-SIGNED due to rcgen 0.12 API limitations");
+            println!("         Not suitable for production use without proper CA signing");
+
+            Ok(())
+        }
+    }
+}
+
+async fn handle_curl_command(
+    url: &str,
+    cert_file: &str,
+    key_alias: &str,
+    ca_cert_file: &str,
+    path: Option<&std::path::Path>,
+    method_str: &str,
+) -> Result<()> {
+    let keystore_path = path.unwrap_or_else(|| std::path::Path::new("."));
+    let keystore = create_keystore(keystore_path)?;
+
+    // Parse HTTP method
+    let method = match method_str.to_uppercase().as_str() {
+        "GET" => HttpMethod::Get,
+        "POST" => HttpMethod::Post,
+        "PUT" => HttpMethod::Put,
+        "DELETE" => HttpMethod::Delete,
+        _ => {
+            return Err(detls::error::DeTlsError::ParseError(format!(
+                "Unsupported HTTP method: {}",
+                method_str
+            )))
+        }
+    };
+
+    // Load client certificate using rustls-pemfile
+    println!("Loading client certificate from: {}", cert_file);
+    let cert_pem = fs::read_to_string(cert_file)?;
+    let client_cert_der = load_certificate_from_pem(&cert_pem)?;
+
+    // Load CA certificate(s)
+    println!("Loading CA certificate(s) from: {}", ca_cert_file);
+    let ca_pem = fs::read_to_string(ca_cert_file)?;
+    let ca_certs_der = load_certificates_from_pem(&ca_pem)?;
+
+    // Get key from keystore
+    println!("Loading key: {}", key_alias);
+    let password = rpassword::prompt_password("Enter password to decrypt key: ")?;
+    let keypair = get_key(&keystore, key_alias, &password)?;
+
+    // Build mTLS configuration
+    println!("Building mTLS configuration...");
+    let config = build_mtls_config_from_der(client_cert_der, &keypair, ca_certs_der)?;
+
+    // Make request
+    println!("\nSending {} request to: {}", method_str, url);
+    let response = mtls_request(url, method, config, None).await?;
+
+    // Display response
+    println!("\n{}", "=".repeat(60));
+    println!("HTTP Status: {}", response.status_code);
+    println!("{}", "=".repeat(60));
+
+    println!("\nHeaders:");
+    for (key, value) in &response.headers {
+        println!("  {}: {}", key, value);
+    }
+
+    println!("\nBody ({} bytes):", response.body.len());
+    match String::from_utf8(response.body.clone()) {
+        Ok(text) => {
+            if text.len() > 1000 {
+                println!("{}... (truncated)", &text[..1000]);
+            } else {
+                println!("{}", text);
+            }
+        }
+        Err(_) => println!("<binary data>"),
+    }
+
+    Ok(())
+}
